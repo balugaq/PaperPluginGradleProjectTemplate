@@ -1,0 +1,283 @@
+name: Test Plugin Compatibility
+
+env:
+  # 默认测试版本（push/PR 触发时用这套；手动触发可覆盖）
+  DEFAULT_VERSIONS: '1.20.1,1.21.11,26.2'
+
+# push/PR 仅在代码或构建配置变更时触发；手动触发不受路径过滤限制。
+# 先在本次 run 内完成 CI 构建（与 build.yml 同流程），
+# 兼容测试 job 通过 needs 依赖构建 job，复用本次 run 的 jar 产物
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - 'src/main/**'
+      - 'gradle/libs.versions.toml'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - 'src/main/**'
+      - 'gradle/libs.versions.toml'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: '要测试的 MC 版本，逗号分隔（留空用默认列表）'
+        required: false
+        default: '1.20.1,1.21.11,26.2'
+
+permissions:
+  actions: read
+
+jobs:
+  # 与 build.yml 相同的构建流程，产物供本工作流的兼容测试使用
+  build:
+    name: Build (CI)
+    if: startsWith(github.event.head_commit.message, '[ci skip]') == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle
+
+      - name: Run tests
+        run: gradle test
+
+      - name: Build with Gradle
+        run: gradle clean build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}
+          path: build/libs/*.jar
+
+  prepare:
+    name: Prepare (split versions)
+    if: startsWith(github.event.head_commit.message, '[ci skip]') == false
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.split.outputs.versions }}
+    steps:
+      - name: Split versions input
+        id: split
+        env:
+          RAW: ${{ github.event.inputs.versions }}
+        run: |
+          [ -z "$RAW" ] && RAW="$DEFAULT_VERSIONS"
+          VERSIONS=$(echo "$RAW" | tr -d ' ' | tr ',' '\n' | jq -R . | jq -sc .)
+          echo "Test versions: $VERSIONS"
+          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+
+  test:
+    name: Compatibility Test (MC ${{ matrix.version }})
+    needs: [ build, prepare ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.prepare.outputs.versions) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          # 21 跑旧版本；26.x 起的 Paper 要求 Java 25
+          java-version: |
+            21
+            25
+
+      # jar 来自本次 run 的构建 job，按名字取（须与 build job 的 upload-artifact 一致）
+      - name: Download plugin jar from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}
+          path: build/libs
+
+      # 提前解析最新 build 号：缓存 key 挂上它，Paper 出新 build 才 cache miss，
+      # 否则命中缓存直接跳过下载（同时校验版本是否存在、取最低 Java 要求）
+      - name: Resolve Paper version and build
+        id: resolve
+        env:
+          VER: ${{ matrix.version }}
+        run: |
+          RESOLVE=$(python3 << 'EOF' 2>&1
+          import json, os, urllib.request
+
+          ver = os.environ['VER']
+          UA = {'User-Agent': 'paper-compat-check-ci'}
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers=UA)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          data = fetch('https://fill.papermc.io/v3/projects/paper/versions')
+          items = data['versions'] if isinstance(data, dict) else data
+          ids = [v['version']['id'] for v in items]
+
+          if ver not in ids:
+              # 前缀匹配：输入 26.1 → 提示 26.1.1 / 26.1.2
+              near = sorted(i for i in ids if i.startswith(ver + '.'))
+              print('SUGGEST=' + ', '.join(near) if near else 'NO_SUGGEST')
+              raise SystemExit(0)
+
+          print('EXISTS')
+          entry = next(v for v in items if v['version']['id'] == ver)
+          minimum = entry['version'].get('java', {}).get('version', {}).get('minimum', 21)
+          print(f'MINJAVA={minimum}')
+
+          builds = fetch(f'https://fill.papermc.io/v3/projects/paper/versions/{ver}/builds')
+          if isinstance(builds, dict) or not builds:
+              raise SystemExit(f'builds API 返回异常: {json.dumps(builds)[:300]}')
+          latest = max(builds, key=lambda b: b.get('id', 0))
+          url = (latest.get('downloads') or {}).get('server:default', {}).get('url')
+          if not url:
+              raise SystemExit(f"build {latest.get('id')} 没有下载地址: {json.dumps(latest)[:300]}")
+          print(f'BUILD={latest.get("id")}')
+          print(f'URL={url}')
+          EOF
+          ) || {
+            echo "::error::校验 Paper $VER 时出错: $RESOLVE"
+            exit 1
+          }
+
+          if [[ "$RESOLVE" == SUGGEST=* ]]; then
+            echo "::notice::Paper $VER 不存在。Did you mean: ${RESOLVE#SUGGEST=}"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [[ "$RESOLVE" == NO_SUGGEST* ]]; then
+            echo "::error::Paper $VER 不存在，且没有以它开头的相近版本号，无法测试"
+            exit 1
+          fi
+          if [[ "$RESOLVE" != *EXISTS* ]]; then
+            echo "::error::Paper $VER: $RESOLVE"
+            exit 1
+          fi
+
+          BUILD=$(echo "$RESOLVE" | grep -oP 'BUILD=\K\d+' | head -n 1)
+          MINJAVA=$(echo "$RESOLVE" | grep -oP 'MINJAVA=\K\d+' | head -n 1)
+          URL=$(echo "$RESOLVE" | grep -oP 'URL=\K.*' | head -n 1)
+          MINJAVA=${MINJAVA:-21}
+          echo "Paper $VER build $BUILD，最低 Java 要求: $MINJAVA"
+          echo "build=$BUILD" >> $GITHUB_OUTPUT
+          echo "minjava=$MINJAVA" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      # 缓存 jar 按 build 号分文件存在 .paper-cache 里，key 也挂 build 号：
+      # 新 build 出来自动 miss 重下并落新缓存，旧 build 命中后脚本跳过下载；
+      # 原版库/补丁产物单独缓存，省掉 paperclip 每次解压的几分钟
+      - name: Cache Paper server
+        if: steps.resolve.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            .paper-cache
+            server/cache
+            server/caches
+            server/libraries
+            server/versions
+          # 不挂 build 号：Paper 每日多发版，挂上等于每次 miss，paperclip 会重下全部库
+          key: paper-server-${{ matrix.version }}-v1
+          restore-keys: |
+            paper-server-${{ matrix.version }}-
+
+      # 只有 plugin.yml 的 depend / softdepend 里确实需要预装别的插件时才打开下面的下载；
+      # 纯 Paper API 插件、或依赖仅以 compileOnly 引入（运行期不需要）时，保持注释即可
+      - name: Download dependency plugins (optional)
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          # 启动脚本会把构建产物复制到这里，目录必须存在
+          mkdir -p server/plugins
+
+          # curl -L -o server/plugins/ExampleDependency.jar \
+          #   "https://example.com/plugins/ExampleDependency/latest/download"
+
+      - name: Run Paper server and load plugin
+        id: run-server
+        if: steps.resolve.outputs.skip != 'true'
+        env:
+          PAPER_URL: ${{ steps.resolve.outputs.url }}
+          PAPER_MINJAVA: ${{ steps.resolve.outputs.minjava }}
+        run: |
+          cp build/libs/*.jar server/plugins/
+
+          bash scripts/run-server.sh "${{ matrix.version }}"
+
+          # 服务端控制台日志全量打到 job 日志，方便直接在页面看
+          echo "======== server console.log ========"
+          cat server/console.log || true
+          echo "======== end of console.log ========"
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log-${{ matrix.version }}
+          path: server/console.log
+          if-no-files-found: warn
+
+      - name: Check server logs
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          LOG_FILE=server/console.log
+          if [ ! -f "$LOG_FILE" ]; then
+            echo "::error::没有找到日志文件，服务端可能根本没启动"
+            exit 1
+          fi
+
+          # 插件名/版本从产物 jar 内的 plugin.yml 取（Gradle 工程名与 Bukkit 插件名常不一致）；
+          # plugin.yml 的 ${version} 占位符在 processResources 阶段已被 Gradle 版本号替换
+          JAR=$(ls build/libs/*.jar | head -n 1)
+          PLUGIN_NAME=$(unzip -p "$JAR" plugin.yml | grep -oP '^name: *\K.*' | head -n 1)
+          PLUGIN_VERSION=$(unzip -p "$JAR" plugin.yml | grep -oP '^version: *\K.*' | head -n 1)
+          echo "Testing plugin: $PLUGIN_NAME v$PLUGIN_VERSION"
+
+          # 以 "Done (x.xxs)!" 为界：插件在 Done 之前被 Disabling = 开服阶段就炸了，判失败
+          DONE_LINE=$(grep -n 'Done (' "$LOG_FILE" | head -n 1 | cut -d: -f1)
+          if [ -z "$DONE_LINE" ]; then
+            echo "::error::服务端在 MC ${{ matrix.version }} 上没能完成启动（未找到 Done 行）"
+            exit 1
+          fi
+
+          DISABLE_LINE=$(grep -n "\[${PLUGIN_NAME}\] Disabling ${PLUGIN_NAME}" "$LOG_FILE" | head -n 1 | cut -d: -f1)
+          if [ -n "$DISABLE_LINE" ] && [ "$DISABLE_LINE" -lt "$DONE_LINE" ]; then
+            echo "::error::插件在 MC ${{ matrix.version }} 上开服阶段即被禁用（Disabling 出现在 Done 之前）"
+            grep -n "Disabling ${PLUGIN_NAME}" "$LOG_FILE"
+            exit 1
+          fi
+
+          # 没出现 Enabling 说明插件压根没加载成功（崩溃/依赖缺失）
+          if ! grep -q "Enabling ${PLUGIN_NAME}" "$LOG_FILE"; then
+            echo "::error::插件在 MC ${{ matrix.version }} 上未成功启用（未找到 Enabling 日志）"
+            exit 1
+          fi
+
+          echo "✅ OK: 插件在 MC ${{ matrix.version }} 上正常启用"
